@@ -25,6 +25,7 @@ struct Index {
   @State private webUrl: string = '';
   @State private fallbackNotice: string = '';
   @State private sourceFilter: string = '';
+  @State private settingsPage: string = 'home';
   @State private ready: boolean = false;
   private api: CommunityApi = new CommunityApi();
   private storage: LocalStore = new LocalStore();
@@ -50,6 +51,7 @@ struct Index {
       this.webUrl = ''; this.fallbackNotice = ''; return true;
     }
     if (this.selected) { this.closeDetail(); return true; }
+    if (this.tab === 2 && this.settingsPage !== 'home') { this.settingsPage = 'home'; this.message = ''; return true; }
     if (this.tab !== 0) { this.tab = 0; return true; }
     return false;
   }
@@ -184,11 +186,21 @@ struct Index {
   @Builder private feed() {
     Column({ space: 16 }) {
       Text('今天，读点新东西').fontSize(28).fontWeight(FontWeight.Bold).fontColor(this.ink()).width('100%')
-      Row({ space: 12 }) {
-        Button('V2EX').backgroundColor(this.site === 'v2ex' ? '#287661' : this.card()).fontColor(this.site === 'v2ex' ? '#FFFFFF' : this.ink()).onClick(() => this.switchSite('v2ex'))
-        Button('Linux.do').backgroundColor(this.site === 'linuxdo' ? '#287661' : this.card()).fontColor(this.site === 'linuxdo' ? '#FFFFFF' : this.ink()).onClick(() => this.switchSite('linuxdo'))
-        Blank()
-      }.width('100%')
+      Scroll() {
+        Row({ space: 10 }) {
+          ForEach(visibleSources(this.library.sourceOrder, this.library.hiddenSources, this.library.sourceLimit), (source: WebSource) => {
+            Button(source.name).backgroundColor(this.site === source.id ? '#287661' : this.card())
+              .fontColor(this.site === source.id ? '#FFFFFF' : this.ink())
+              .onClick(() => {
+                if (source.id === 'v2ex') { this.switchSite('v2ex'); }
+                else if (source.id === 'linuxdo') { this.switchSite('linuxdo'); }
+                else { this.fallbackNotice = ''; this.webUrl = source.url; }
+              })
+          }, (source: WebSource) => source.id)
+        }
+      }.scrollable(ScrollDirection.Horizontal).scrollBar(BarState.Off).width('100%')
+      Text('左右滑动选择站点 · 显示数量与顺序可在设置中调整').fontSize(12).fontColor(this.muted()).width('100%')
+      if (visibleSources(this.library.sourceOrder, this.library.hiddenSources, this.library.sourceLimit).some((source: WebSource) => source.id === this.site)) {
       Row({ space: 16 }) {
         Button(this.hot ? '最新' : '✓ 最新').backgroundColor(this.card()).fontColor(this.ink()).onClick(() => { this.hot = false; this.loadFeed(); })
         Button(this.hot ? '✓ 热门' : '热门').backgroundColor(this.card()).fontColor(this.ink()).onClick(() => { this.hot = true; this.loadFeed(); })
@@ -212,6 +224,11 @@ struct Index {
       }.layoutWeight(1).width('100%')
         .onDidScroll(() => { this.feedOffset = this.feedScroller.currentOffset().yOffset; })
         .onAppear(() => { const offset = this.feedOffset; setTimeout(() => { if (!this.selected && this.tab === 0) { this.feedScroller.scrollTo({ xOffset: 0, yOffset: offset }); } }, 80); })
+      } else {
+        this.note('当前原生站点未在显示范围内，请选择上方站点，或在设置中调整数量和显示开关。其他技术站点会打开原站网页。')
+        Button('管理站点').onClick(() => { this.settingsPage = 'sites'; this.tab = 2; })
+        Blank()
+      }
     }.padding({ left: 20, right: 20, top: 18 }).height('100%')
   }
   @Builder private topicView(detail: Detail) {
@@ -233,7 +250,7 @@ struct Index {
           Column({ space: 16 }) {
             Text(detail.topic.title).fontSize(26).fontWeight(FontWeight.Bold).fontColor(this.ink())
             Text(`${detail.topic.author} · ${detail.topic.category}`).fontSize(13).fontColor(this.muted())
-            RichText(richDocument(detail.topic.html || '', detail.topic.body || '正文尚未载入，请等待或在原站查看。', this.library.fontSize, this.library.dark, detail.topic.site)).width('100%')
+            RichText(richDocument(detail.topic.html || '', detail.topic.body || '正文尚未载入，请等待或在原站查看。', this.getUIContext().fp2px(this.library.fontSize), this.library.dark, detail.topic.site)).width('100%')
             Text(`评论 · 已加载 ${detail.replies.length} / ${detail.topic.replies}`).fontSize(18).fontColor(this.ink()).width('100%')
           }.alignItems(HorizontalAlign.Start).width('100%')
         }
@@ -241,7 +258,7 @@ struct Index {
           ListItem() {
             Column({ space: 10 }) {
               Text(`${reply.author} · #${reply.floor}`).fontSize(13).fontColor('#348869')
-              RichText(richDocument(reply.html || '', reply.body, this.library.fontSize - 1, this.library.dark, detail.topic.site)).width('100%')
+              RichText(richDocument(reply.html || '', reply.body, this.getUIContext().fp2px(this.library.fontSize), this.library.dark, detail.topic.site)).width('100%')
             }.alignItems(HorizontalAlign.Start).padding(16).backgroundColor(this.card()).borderRadius(14).width('100%')
           }
         }, (reply: Reply) => reply.id)
@@ -266,41 +283,49 @@ struct Index {
       ListItem() { Button('清空历史与进度').onClick(() => { this.library.history = []; this.library.progress = {}; this.persist(); }) }
     }.padding(20).height('100%').width('100%')
   }
+  @Builder private settingsEntry(title: string, summary: string, destination: string) {
+    Row({ space: 12 }) {
+      Column({ space: 5 }) {
+        Text(title).fontSize(18).fontWeight(FontWeight.Medium).fontColor(this.ink())
+        Text(summary).fontSize(13).fontColor(this.muted()).maxLines(2)
+      }.alignItems(HorizontalAlign.Start).layoutWeight(1)
+      Text('›').fontSize(24).fontColor(this.muted())
+    }.width('100%').padding(18).backgroundColor(this.card()).borderRadius(14)
+      .onClick(() => { this.settingsPage = destination; this.message = ''; })
+  }
+  private settingsTitle(): string {
+    if (this.settingsPage === 'sites') { return '站点管理'; }
+    if (this.settingsPage === 'reading') { return '阅读体验'; }
+    if (this.settingsPage === 'account') { return '账号'; }
+    if (this.settingsPage === 'data') { return '数据管理'; }
+    if (this.settingsPage === 'about') { return '关于我们'; }
+    return '栈里拾光';
+  }
   @Builder private settings() {
-    Scroll() {
-      Column({ space: 20 }) {
-        Text('账号与阅读设置').fontSize(26).fontWeight(FontWeight.Bold).fontColor(this.ink()).width('100%')
-        this.note(this.accountName ? `V2EX · ${this.accountName}` : '当前使用游客模式，无需登录即可阅读公开内容。')
-        if (!this.accountName) {
-          TextInput({ placeholder: 'V2EX 个人访问令牌', text: this.tokenInput }).type(InputType.Password).onChange((value: string) => { this.tokenInput = value; })
-          Button(this.loginBusy ? '验证中…' : '登录 V2EX').enabled(!this.loginBusy).onClick(() => this.login())
-          Button('如何获取令牌').onClick(() => { this.webUrl = 'https://www.v2ex.com/settings/tokens'; })
-          this.note('令牌仅保存在内存，关闭应用后需重新登录；应用不收集社区密码。登录不会自动同步本地记录。')
-        } else { Button('退出 V2EX').onClick(() => this.logout()) }
-        Button('Linux.do 原站登录 / 阅读').onClick(() => { this.webUrl = 'https://linux.do/login'; })
-        this.note('Linux.do 登录仅在原站浏览页生效，当前原生列表仍使用游客接口；不宣称已接通原生账号权限。')
-        Button('清除原站网页会话').onClick(async () => {
-          try { await webview.WebCookieManager.clearAllCookies(); this.message = '网页 Cookie 已清除；网页自身保存的其他数据由系统 Web 组件管理。'; }
-          catch { this.message = '网页会话清除失败，请重试。'; }
-        })
-        Text(`正文字号 · ${this.library.fontSize}`).fontSize(18).fontColor(this.ink())
-        Slider({ value: this.library.fontSize, min: 14, max: 24, step: 1 }).onChange((value: number) => { this.library.fontSize = value; this.persist(); })
-        Row() {
-          Text('深色阅读').fontColor(this.ink()); Blank()
-          Toggle({ type: ToggleType.Switch, isOn: this.library.dark }).onChange((on: boolean) => { this.library.dark = on; this.persist(); })
-        }.width('100%')
-        Row() {
-          Text('失败时自动打开原站').fontColor(this.ink()).layoutWeight(1)
-          Toggle({ type: ToggleType.Switch, isOn: this.library.autoFallback }).onChange((on: boolean) => { this.library.autoFallback = on; this.persist(); })
-        }.width('100%')
-        this.note('开启后，V2EX 或 Linux.do 的原生列表、正文、评论请求失败时，会自动用应用内网页打开对应原站页面。默认关闭，设置保存在本机；原站网页失败不会循环跳转。关闭时保留错误提示与离线缓存。')
-        Text('技术站点 · 显示与顺序').fontSize(20).fontWeight(FontWeight.Medium).fontColor(this.ink()).width('100%')
+    Column({ space: 0 }) {
+      Row({ space: 12 }) {
+        if (this.settingsPage !== 'home') {
+          Button('‹ 返回').backgroundColor(this.card()).fontColor(this.ink()).onClick(() => { this.settingsPage = 'home'; this.message = ''; })
+        }
+        Text(this.settingsTitle()).fontSize(this.settingsPage === 'home' ? 28 : 23).fontWeight(FontWeight.Bold).fontColor(this.ink()).layoutWeight(1)
+      }.width('100%').padding(20)
+      Scroll() {
+        Column({ space: 14 }) {
+          if (this.settingsPage === 'home') {
+            Text('在技术的世界里，拾起值得留住的时光。').fontSize(14).fontColor(this.muted()).width('100%').margin({ bottom: 8 })
+            this.settingsEntry('站点管理', '显示 ' + visibleSources(this.library.sourceOrder, this.library.hiddenSources, this.library.sourceLimit).length + ' 个站点 · 数量与顺序', 'sites')
+            this.settingsEntry('阅读体验', this.library.fontSize + ' 号字 · ' + (this.library.dark ? '深色' : '浅色') + ' · 失败自动降级' + (this.library.autoFallback ? '已开启' : '未开启'), 'reading')
+            this.settingsEntry('账号', this.accountName ? 'V2EX 已登录：' + this.accountName : '游客模式 · 登录为可选', 'account')
+            this.settingsEntry('数据管理', '离线缓存、阅读记录与网页会话', 'data')
+            this.settingsEntry('关于我们', '名字的故事、应用介绍与隐私说明', 'about')
+            Text('栈里拾光 0.1.0').fontSize(12).fontColor(this.muted()).margin({ top: 20 })
+          } else if (this.settingsPage === 'sites') {
         Row({ space: 12 }) {
           Text(`最多显示 ${this.library.sourceLimit} 个`).fontColor(this.ink()).layoutWeight(1)
           Button('−').enabled(this.library.sourceLimit > 0).onClick(() => { this.library.sourceLimit--; this.persist(); })
           Button('+').enabled(this.library.sourceLimit < WEB_SOURCES.length).onClick(() => { this.library.sourceLimit++; this.persist(); })
         }.width('100%')
-        this.note('先按下方顺序排除隐藏站点，再取前 N 个显示。调整立即生效并自动保存；仅影响“技术站点”页，不影响原生阅读页。')
+        this.note('先按下方顺序排除隐藏站点，再取前 N 个显示。调整立即生效并自动保存，同时影响主页站点栏与“技术站点”页。主页站点栏可左右滑动。')
         ForEach(orderedSources(this.library.sourceOrder), (source: WebSource, index: number) => {
           Column({ space: 8 }) {
             Row() {
@@ -320,14 +345,68 @@ struct Index {
         Button('恢复默认站点设置').onClick(() => {
           this.library.sourceOrder = []; this.library.hiddenSources = []; this.library.sourceLimit = WEB_SOURCES.length; this.persist();
         })
+
+          } else if (this.settingsPage === 'reading') {
+        Text(`正文字号 · ${this.library.fontSize}`).fontSize(18).fontColor(this.ink())
+        Slider({ value: this.library.fontSize, min: 14, max: 24, step: 1 }).onChange((value: number) => { this.library.fontSize = value; this.persist(); })
+        Row() {
+          Text('深色阅读').fontColor(this.ink()); Blank()
+          Toggle({ type: ToggleType.Switch, isOn: this.library.dark }).onChange((on: boolean) => { this.library.dark = on; this.persist(); })
+        }.width('100%')
+        Row() {
+          Text('失败时自动打开原站').fontColor(this.ink()).layoutWeight(1)
+          Toggle({ type: ToggleType.Switch, isOn: this.library.autoFallback }).onChange((on: boolean) => { this.library.autoFallback = on; this.persist(); })
+        }.width('100%')
+        this.note('开启后，V2EX 或 Linux.do 的原生列表、正文、评论请求失败时，会自动用应用内网页打开对应原站页面。默认关闭，设置保存在本机；原站网页失败不会循环跳转。关闭时保留错误提示与离线缓存。')
+
+            Text('阅读预览').fontSize(14).fontColor(this.muted()).width('100%')
+            Text('在代码之间，留一点时间读世界。').fontSize(this.library.fontSize).lineHeight(this.library.fontSize * 1.85).fontColor(this.ink()).padding(18).backgroundColor(this.card()).borderRadius(14).width('100%')
+          } else if (this.settingsPage === 'account') {
+        this.note(this.accountName ? `V2EX · ${this.accountName}` : '当前使用游客模式，无需登录即可阅读公开内容。')
+        if (!this.accountName) {
+          TextInput({ placeholder: 'V2EX 个人访问令牌', text: this.tokenInput }).type(InputType.Password).onChange((value: string) => { this.tokenInput = value; })
+          Button(this.loginBusy ? '验证中…' : '登录 V2EX').enabled(!this.loginBusy).onClick(() => this.login())
+          Button('如何获取令牌').onClick(() => { this.webUrl = 'https://www.v2ex.com/settings/tokens'; })
+          this.note('令牌仅保存在内存，关闭应用后需重新登录；应用不收集社区密码。登录不会自动同步本地记录。')
+        } else { Button('退出 V2EX').onClick(() => this.logout()) }
+        Button('Linux.do 原站登录 / 阅读').onClick(() => { this.webUrl = 'https://linux.do/login'; })
+        this.note('Linux.do 登录仅在原站浏览页生效，当前原生列表仍使用游客接口；不宣称已接通原生账号权限。')
+
+          } else if (this.settingsPage === 'data') {
+            this.note('清除正文缓存会移除离线内容，稍后读与阅读历史仍保留。')
         Button('清除离线正文缓存').onClick(async () => {
           try { await this.storage.clearCache(); this.message = '离线缓存已清除，稍后读与历史保留。'; }
           catch { this.message = '清除缓存失败，请重试。'; }
         })
-        if (this.message) { this.note(this.message) }
+
+        Button('清除原站网页会话').onClick(async () => {
+          try { await webview.WebCookieManager.clearAllCookies(); this.message = '网页 Cookie 已清除；网页自身保存的其他数据由系统 Web 组件管理。'; }
+          catch { this.message = '网页会话清除失败，请重试。'; }
+        })
+
+            Button('清空历史与阅读进度').onClick(() => {
+              this.getUIContext().showAlertDialog({ title: '清空阅读记录？', message: '阅读历史和进度将被删除，稍后读仍保留。',
+                primaryButton: { value: '取消', action: () => {} },
+                secondaryButton: { value: '清空记录', action: () => { this.library.history = []; this.library.progress = {}; this.persist(); this.message = '阅读历史与进度已清空。'; } }
+              });
+            })
+          } else if (this.settingsPage === 'about') {
+            Text('栈里拾光').fontSize(32).fontWeight(FontWeight.Bold).fontColor(this.ink()).margin({ top: 12 })
+            Text('技术好内容，一处慢慢读。').fontSize(17).fontColor('#348869').margin({ bottom: 16 })
+            Text('名字的由来').fontSize(19).fontWeight(FontWeight.Medium).fontColor(this.ink())
+            Text('“栈”是开发者熟悉的技术栈，也是不断积累的知识；“拾光”是在日常的碎片时间里，拾起值得阅读、思考和留存的内容。我们希望，在代码与忙碌之间，为你留下一处安静的阅读空间。').fontSize(16).lineHeight(29).fontColor(this.ink())
+            Text('我们在做什么').fontSize(19).fontWeight(FontWeight.Medium).fontColor(this.ink()).margin({ top: 12 })
+            Text('栈里拾光是一款面向鸿蒙手机的技术社区阅读工具。你可以阅读 V2EX、Linux.do，或从技术站点入口浏览掘金、思否、InfoQ、开源中国、GitHub Trending 和 Hacker News。支持本地稍后读、阅读记录与个性化阅读设置。').fontSize(16).lineHeight(29).fontColor(this.ink())
+            Text('尊重每一份分享').fontSize(19).fontWeight(FontWeight.Medium).fontColor(this.ink()).margin({ top: 12 })
+            Text('我们提供阅读入口，内容归原作者及原站所有。栈里拾光与上述社区不存在官方隶属关系；网页内容和账号权限遵循各站规则。').fontSize(16).lineHeight(29).fontColor(this.ink())
+            Text('版本与隐私').fontSize(19).fontWeight(FontWeight.Medium).fontColor(this.ink()).margin({ top: 12 })
         this.note('隐私说明：原生请求直接发送至 V2EX 或 Linux.do；技术站点页仅在点击后加载对应网站，网页可能访问其自身服务和链接网站。本应用无自有服务器、广告或统计 SDK；原站网页遵循各自隐私规则。阅读记录保存在设备，卸载后随应用数据删除。')
         this.note('栈里拾光 0.1.0 · 非官方客户端。请遵守社区规则与内容版权。此版本为开发验证版，尚未完成上架审核。')
-      }.padding(20).width('100%')
+
+          }
+          if (this.message && this.settingsPage !== 'home') { this.note(this.message) }
+        }.padding({ left: 20, right: 20, bottom: 24 }).width('100%').alignItems(HorizontalAlign.Start)
+      }.layoutWeight(1).width('100%')
     }.height('100%').width('100%')
   }
   @Builder private sources() {
@@ -337,7 +416,7 @@ struct Index {
       Row() {
         Text(`已显示 ${visibleSources(this.library.sourceOrder, this.library.hiddenSources, this.library.sourceLimit).length} 个站点`).fontSize(13).fontColor(this.muted())
         Blank()
-        Button('管理显示与排序').onClick(() => { this.tab = 2; })
+        Button('管理显示与排序').onClick(() => { this.settingsPage = 'sites'; this.tab = 2; })
       }.width('100%')
       TextInput({ placeholder: '搜索站点、分类或方向', text: this.sourceFilter }).onChange((value: string) => { this.sourceFilter = value; })
       List({ space: 12 }) {
@@ -394,7 +473,7 @@ struct Index {
           Button('阅读').fontColor(this.tab === 0 ? '#287661' : this.muted()).backgroundColor(this.card()).layoutWeight(1).onClick(() => { this.tab = 0; })
           Button('我的阅读').fontColor(this.tab === 1 ? '#287661' : this.muted()).backgroundColor(this.card()).layoutWeight(1).onClick(() => { this.tab = 1; })
           Button('技术站点').fontColor(this.tab === 3 ? '#287661' : this.muted()).backgroundColor(this.card()).layoutWeight(1).onClick(() => { this.tab = 3; })
-          Button('设置').fontColor(this.tab === 2 ? '#287661' : this.muted()).backgroundColor(this.card()).layoutWeight(1).onClick(() => { this.tab = 2; })
+          Button('设置').fontColor(this.tab === 2 ? '#287661' : this.muted()).backgroundColor(this.card()).layoutWeight(1).onClick(() => { this.settingsPage = 'home'; this.message = ''; this.tab = 2; })
         }.padding(14).backgroundColor(this.card()).width('100%')
       }
     }.width('100%').height('100%').backgroundColor(this.bg())

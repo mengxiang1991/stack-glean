@@ -37,13 +37,14 @@ export function sanitizeContent(input: string, origin: string): string {
     return `<${name}>`;
   }).join('');
 }
+// RichText uses physical CSS pixels; caller converts configured fp with UIContext.fp2px.
 export function richDocument(html: string, fallback: string, size: number, dark: boolean, site: string): string {
   const origin = site === 'v2ex' ? 'https://www.v2ex.com' : 'https://linux.do';
   const content = html ? sanitizeContent(html, origin) : `<p>${attribute(fallback).replace(/\n/g, '<br>')}</p>`;
   return `<html><head><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src https:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"><style>
     html,body{margin:0;padding:0;background:${dark ? '#14201d' : '#f4f5f2'};color:${dark ? '#e4eee7' : '#233d32'};font-family:sans-serif;font-size:${size}px;line-height:1.85;overflow-wrap:anywhere}
-    p,div{margin:0 0 1em}img{max-width:100%;height:auto;border-radius:8px}a{color:${dark ? '#8ed7b6' : '#287661'}}
-    h1,h2,h3{line-height:1.5;font-size:1.25em}pre{overflow-x:auto;white-space:pre;padding:12px;background:${dark ? '#263c32' : '#e6ece6'};border-radius:8px}code{font-family:monospace;font-size:.88em}blockquote{margin:12px 0;padding:8px 14px;border-left:3px solid #348869;background:${dark ? '#20332b' : '#e6ece6'}}
+    p,div{margin:0 0 1em;font-size:inherit}span,li,td,th{font-size:inherit}img{max-width:100%;height:auto;border-radius:.5em}a{color:${dark ? '#8ed7b6' : '#287661'}}
+    h1,h2,h3{line-height:1.5;font-size:1.25em}pre{overflow-x:auto;white-space:pre;padding:.75em;background:${dark ? '#263c32' : '#e6ece6'};border-radius:.5em}code{font-family:monospace;font-size:.95em}blockquote{margin:.75em 0;padding:.5em .85em;border-left:.18em solid #348869;background:${dark ? '#20332b' : '#e6ece6'}}
     table{display:block;max-width:100%;overflow-x:auto;border-collapse:collapse}td,th{border:1px solid #81978b;padding:6px}ul,ol{padding-left:24px}
     </style></head><body>${content}</body></html>`;
 }
