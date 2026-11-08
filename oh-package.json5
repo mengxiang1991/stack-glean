@@ -1,0 +1,8 @@
+{
+  "modelVersion": "6.0.0",
+  "name": "zhanli-shiguang",
+  "version": "0.1.0",
+  "description": "栈里拾光 · 鸿蒙技术社区阅读器",
+  "dependencies": {},
+  "devDependencies": {}
+}
