@@ -28,6 +28,12 @@ function load(file) {
   return module.exports;
 }
 (async () => {
+  const { readingOffsetToSave } = load(path.join(root, 'domain/Models.ets'));
+  assert.equal(readingOffsetToSave(false, 90, 420), undefined);
+  assert.equal(readingOffsetToSave(true, undefined, 420), undefined);
+  assert.equal(readingOffsetToSave(true, 420, 420), undefined);
+  assert.equal(readingOffsetToSave(true, 520, 420), 520);
+  assert.equal(readingOffsetToSave(true, 0, 420), 0);
   const { CommunityApi, readable } = load(path.join(root, 'data/CommunityApi.ets'));
   const { sanitizeContent, richDocument } = load(path.join(root, 'domain/RichContent.ets'));
   const { orderedSources, visibleSources, moveSource } = load(path.join(root, 'domain/WebSources.ets'));

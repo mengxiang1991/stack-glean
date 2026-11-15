@@ -1,6 +1,6 @@
 import { common } from '@kit.AbilityKit';
 import { webview } from '@kit.ArkWeb';
-import { Topic, Reply, Detail, Library, Site, topicKey } from '../domain/Models';
+import { Topic, Reply, Detail, Library, Site, topicKey, readingOffsetToSave } from '../domain/Models';
 import { CommunityApi } from '../data/CommunityApi';
 import { LocalStore } from '../data/LocalStore';
 import { richDocument } from '../domain/RichContent';
@@ -27,6 +27,11 @@ struct Index {
   @State private sourceFilter: string = '';
   @State private settingsPage: string = 'home';
   @State private ready: boolean = false;
+  @State private detailLoaded: boolean = false;
+  @State private detailFailed: boolean = false;
+  @State private libraryQuery: string = '';
+  @State private unreadOnly: boolean = false;
+  @State private floorInput: string = '';
   private api: CommunityApi = new CommunityApi();
   private storage: LocalStore = new LocalStore();
   private webController: webview.WebviewController = new webview.WebviewController();
@@ -37,7 +42,10 @@ struct Index {
   private detailRequestId: number = 0;
   private feedPage: number = 0;
   @State private more: boolean = false;
-  private progressY: number = 0;
+  private progressY: number | undefined = undefined;
+  private visibleReply: string = '';
+
+  onPageHide(): void { this.saveReadingPosition(); }
 
   async aboutToAppear(): Promise<void> {
     try { this.library = await this.storage.open(this.getUIContext().getHostContext() as common.UIAbilityContext); }
@@ -89,13 +97,25 @@ struct Index {
   }
   private switchSite(site: Site): void { if (site !== this.site) { this.site = site; this.loadFeed(); } }
   private async openTopic(topic: Topic): Promise<void> {
+    if (topic.webOnly) {
+      this.webUrl = topic.url;
+      this.fallbackNotice = '';
+      this.library.history = [topic, ...this.library.history.filter((item: Topic) => topicKey(item) !== topicKey(topic))].slice(0, 100);
+      this.persist();
+      return;
+    }
+    this.floorInput = '';
+    this.detailLoaded = false;
+    this.detailFailed = false;
+    this.progressY = undefined;
+    this.visibleReply = '';
     const id = ++this.detailRequestId; const epoch = this.api.epoch;
     const shell = new Detail(); shell.topic = topic; this.selected = shell;
     this.message = '正在加载正文与评论…';
     try {
       const detail = await this.api.detail(topic);
       if (id !== this.detailRequestId || epoch !== this.api.epoch) { return; }
-      this.selected = detail; this.message = ''; this.progressY = 0;
+      this.selected = detail; this.detailLoaded = true; this.message = '';
       // Only public metadata is recorded; authenticated bodies are memory-only.
       if (!this.accountName || topic.site !== 'v2ex') {
         try { await this.storage.cache(detail); } catch { this.message = '内容已加载，但离线缓存保存失败。'; }
@@ -107,20 +127,31 @@ struct Index {
       }
     } catch (e) {
       if (id !== this.detailRequestId || epoch !== this.api.epoch) { return; }
+      this.detailFailed = true;
       if (this.library.autoFallback && !this.webUrl) {
         this.message = (e as Error).message || '主题加载失败。';
         this.fallback(topic.site, topic.id); return;
       }
-      const cached = (!this.accountName || topic.site !== 'v2ex') ? await this.storage.cached(topic) : undefined;
-      if (id !== this.detailRequestId) { return; }
-      if (cached) { this.selected = cached; this.message = '当前显示离线缓存，内容可能不是最新。'; }
+      let cached: Detail | undefined;
+      try { if (!this.accountName || topic.site !== 'v2ex') { cached = await this.storage.cached(topic); } } catch {}
+      if (id !== this.detailRequestId || epoch !== this.api.epoch) { return; }
+      if (cached) { this.selected = cached; this.detailLoaded = true; this.message = '当前显示离线缓存，内容可能不是最新。'; }
       else { this.message = (e as Error).message || '主题加载失败。'; }
     }
   }
-  private closeDetail(): void {
+  private saveReadingPosition(): void {
     if (this.selected && (!this.accountName || this.selected.topic.site !== 'v2ex')) {
-      this.library.progress[topicKey(this.selected.topic)] = this.progressY; this.persist();
+      const key = topicKey(this.selected.topic);
+      const position = readingOffsetToSave(this.detailLoaded, this.progressY, this.library.progress[key]);
+      if (position !== undefined) {
+        this.library.progress[key] = position;
+        this.library.replyAnchors[key] = this.visibleReply;
+        this.persist();
+      }
     }
+  }
+  private closeDetail(): void {
+    this.saveReadingPosition();
     this.detailRequestId++; this.selected = undefined; this.message = '';
   }
   private async moreReplies(): Promise<void> {
@@ -146,9 +177,45 @@ struct Index {
     }
     finally { this.loadingMore = false; }
   }
+  private matchesLibrary(topic: Topic): boolean {
+    return (topic.title + ' ' + topic.author + ' ' + topic.url).toLowerCase().includes(this.libraryQuery.trim().toLowerCase());
+  }
+  private saveWebPage(): void {
+    try {
+      const url = this.webController.getUrl();
+      if (!url.startsWith('https://')) { this.fallbackNotice = '只能保存 HTTPS 网页。'; return; }
+      const topic = new Topic();
+      topic.webOnly = true;
+      topic.id = url;
+      topic.url = url;
+      topic.title = this.webController.getTitle() || url;
+      topic.category = '原站网页';
+      if (!this.bookmarked(topic)) {
+        this.library.bookmarks = [topic, ...this.library.bookmarks].slice(0, 200);
+        this.persist();
+      }
+      this.fallbackNotice = '已保存到稍后读。';
+    } catch { this.fallbackNotice = '请等网页加载完成后再保存。'; }
+  }
+  private jumpFloor(detail: Detail, floor: number): void {
+    const index = detail.replies.findIndex((reply: Reply) => reply.floor === floor);
+    if (index >= 0) {
+      this.message = '';
+      this.detailScroller.scrollToIndex(index + 1, false, ScrollAlign.START);
+    } else if (detail.topic.site === 'linuxdo' && floor === 1) {
+      this.message = '';
+      this.detailScroller.scrollToIndex(0);
+    } else { this.message = '该楼层还未加载，可继续加载评论或查看原帖。'; }
+  }
+  private resumeDetail(detail: Detail): void {
+    const key = topicKey(detail.topic);
+    const index = detail.replies.findIndex((reply: Reply) => reply.id === this.library.replyAnchors[key]);
+    if (index >= 0) { this.detailScroller.scrollToIndex(index + 1, false, ScrollAlign.START); }
+    else { this.detailScroller.scrollTo({ xOffset: 0, yOffset: this.library.progress[key] }); }
+  }
   private bookmarked(topic: Topic): boolean { return this.library.bookmarks.some((t: Topic) => topicKey(t) === topicKey(topic)); }
   private bookmark(topic: Topic): void {
-    if (this.accountName && topic.site === 'v2ex') { this.message = '当前版本暂不保存登录态内容，请在原站收藏。'; return; }
+    if (!topic.webOnly && !this.bookmarked(topic) && this.accountName && topic.site === 'v2ex') { this.message = '当前版本暂不保存登录态内容，请在原站收藏。'; return; }
     if (this.bookmarked(topic)) { this.library.bookmarks = this.library.bookmarks.filter((t: Topic) => topicKey(t) !== topicKey(topic)); }
     else {
       const copy = new Topic(); copy.site = topic.site; copy.id = topic.id; copy.title = topic.title;
@@ -173,7 +240,7 @@ struct Index {
   }
   @Builder private row(topic: Topic) {
     Column({ space: 10 }) {
-      Text(`${topic.site === 'v2ex' ? 'V2EX' : 'Linux.do'} · ${topic.category}`).fontSize(12).fontColor('#348869')
+      Text(topic.webOnly ? '原站网页' : `${topic.site === 'v2ex' ? 'V2EX' : 'Linux.do'} · ${topic.category}`).fontSize(12).fontColor('#348869')
       Text(topic.title).fontSize(18).fontWeight(FontWeight.Medium).fontColor(this.ink()).width('100%')
       Row() {
         Text(topic.author || '社区主题').fontSize(12).fontColor(this.muted())
@@ -239,11 +306,21 @@ struct Index {
         Button('原帖').onClick(() => { this.webUrl = detail.topic.url; }).backgroundColor(this.card()).fontColor(this.ink())
       }.width('100%')
       if (this.message) { this.note(this.message) }
+      if (this.detailFailed) {
+        Button('重试正文与评论').onClick(() => { this.saveReadingPosition(); this.openTopic(detail.topic); })
+      }
       Row({ space: 10 }) {
         Button(this.bookmarked(detail.topic) ? '已加入稍后读' : '稍后读').onClick(() => this.bookmark(detail.topic))
-        if ((this.library.progress[topicKey(detail.topic)] ?? 0) > 0) {
-          Button('恢复进度').onClick(() => this.detailScroller.scrollTo({ xOffset: 0, yOffset: this.library.progress[topicKey(detail.topic)] }))
+        if (this.detailLoaded && (!this.accountName || detail.topic.site !== 'v2ex') && (this.library.progress[topicKey(detail.topic)] ?? 0) > 0) {
+          Button('恢复进度').onClick(() => this.resumeDetail(detail))
         }
+      }
+      if (this.detailLoaded && detail.replies.length > 0) {
+        Row({ space: 8 }) {
+          TextInput({ placeholder: '输入楼层', text: this.floorInput }).type(InputType.Number)
+            .layoutWeight(1).onChange((value: string) => { this.floorInput = value; })
+          Button('跳转').enabled(Number(this.floorInput) > 0).onClick(() => this.jumpFloor(detail, Number(this.floorInput)))
+        }.width('100%')
       }
       List({ space: 16, scroller: this.detailScroller }) {
         ListItem() {
@@ -257,7 +334,10 @@ struct Index {
         ForEach(detail.replies, (reply: Reply) => {
           ListItem() {
             Column({ space: 10 }) {
-              Text(`${reply.author} · #${reply.floor}`).fontSize(13).fontColor('#348869')
+              Text(reply.author + (detail.topic.author && reply.author === detail.topic.author ? '（楼主）' : '') + ' · #' + reply.floor).fontSize(13).fontColor('#348869')
+              if (reply.parentFloor > 0) {
+                Button('查看回复对象 #' + reply.parentFloor).onClick(() => this.jumpFloor(detail, reply.parentFloor))
+              }
               RichText(richDocument(reply.html || '', reply.body, this.getUIContext().fp2px(this.library.fontSize), this.library.dark, detail.topic.site)).width('100%')
             }.alignItems(HorizontalAlign.Start).padding(16).backgroundColor(this.card()).borderRadius(14).width('100%')
           }
@@ -267,7 +347,11 @@ struct Index {
             Button(this.loadingMore ? '加载中…' : '加载更多评论').enabled(!this.loadingMore).onClick(() => this.moreReplies())
           }
         }
-      }.layoutWeight(1).width('100%').onDidScroll(() => { this.progressY = this.detailScroller.currentOffset().yOffset; })
+      }.layoutWeight(1).width('100%').onDidScroll((_offset: number, state: ScrollState) => {
+        if (this.detailLoaded && state !== ScrollState.Idle) { this.progressY = this.detailScroller.currentOffset().yOffset; }
+      }).onScrollIndex((start: number) => {
+        this.visibleReply = start >= 1 && start <= detail.replies.length ? detail.replies[start - 1].id : '';
+      }).onScrollStop(() => { this.saveReadingPosition(); })
     }.padding(20).height('100%')
   }
   @Builder private libraryView() {
@@ -275,12 +359,20 @@ struct Index {
       ListItem() { Text('我的阅读').fontSize(28).fontWeight(FontWeight.Bold).fontColor(this.ink()) }
       ListItem() { this.note('稍后读和历史保存在本机。登录态 V2EX 内容暂不持久保存，避免账号内容混入游客空间。') }
       ListItem() { Text(`稍后读 · ${this.library.bookmarks.length}`).fontSize(19).fontColor(this.ink()) }
-      ForEach(this.library.bookmarks, (topic: Topic) => {
+      ListItem() {
+        Row({ space: 8 }) {
+          TextInput({ placeholder: '搜索标题、作者或链接', text: this.libraryQuery }).layoutWeight(1)
+            .onChange((value: string) => { this.libraryQuery = value; })
+          Button(this.unreadOnly ? '仅未读' : '全部').onClick(() => { this.unreadOnly = !this.unreadOnly; })
+        }
+      }
+      ForEach(this.library.bookmarks.filter((topic: Topic) => this.matchesLibrary(topic) &&
+        (!this.unreadOnly || !this.library.history.some((item: Topic) => topicKey(item) === topicKey(topic)))), (topic: Topic) => {
         ListItem() { Column({ space: 6 }) { this.row(topic); Button('移除').onClick(() => this.bookmark(topic)) } }
       }, (t: Topic) => `b:${topicKey(t)}`)
       ListItem() { Text(`阅读历史 · ${this.library.history.length}`).fontSize(19).fontColor(this.ink()) }
-      ForEach(this.library.history, (topic: Topic) => { ListItem() { this.row(topic) } }, (t: Topic) => `h:${topicKey(t)}`)
-      ListItem() { Button('清空历史与进度').onClick(() => { this.library.history = []; this.library.progress = {}; this.persist(); }) }
+      ForEach(this.library.history.filter((topic: Topic) => this.matchesLibrary(topic)), (topic: Topic) => { ListItem() { this.row(topic) } }, (t: Topic) => `h:${topicKey(t)}`)
+      ListItem() { Button('清空历史与进度').onClick(() => { this.library.history = []; this.library.progress = {}; this.library.replyAnchors = {}; this.persist(); }) }
     }.padding(20).height('100%').width('100%')
   }
   @Builder private settingsEntry(title: string, summary: string, destination: string) {
@@ -387,7 +479,7 @@ struct Index {
             Button('清空历史与阅读进度').onClick(() => {
               this.getUIContext().showAlertDialog({ title: '清空阅读记录？', message: '阅读历史和进度将被删除，稍后读仍保留。',
                 primaryButton: { value: '取消', action: () => {} },
-                secondaryButton: { value: '清空记录', action: () => { this.library.history = []; this.library.progress = {}; this.persist(); this.message = '阅读历史与进度已清空。'; } }
+                secondaryButton: { value: '清空记录', action: () => { this.library.history = []; this.library.progress = {}; this.library.replyAnchors = {}; this.persist(); this.message = '阅读历史与进度已清空。'; } }
               });
             })
           } else if (this.settingsPage === 'about') {
@@ -455,8 +547,8 @@ struct Index {
       } else if (this.webUrl) {
         Row() {
           Button('‹ 返回应用').onClick(() => { this.webUrl = ''; this.fallbackNotice = ''; })
-          Text('原站浏览页').fontSize(14).fontColor(this.ink()).margin({ left: 12 })
           Blank()
+          Button('稍后读').onClick(() => this.saveWebPage())
           Button('刷新').onClick(() => { try { this.webController.refresh(); } catch { this.fallbackNotice = '网页尚未就绪，请稍后重试。'; } })
         }.padding(12).width('100%')
         if (this.fallbackNotice) { this.note(this.fallbackNotice) }

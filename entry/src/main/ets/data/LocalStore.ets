@@ -12,6 +12,7 @@ export class LocalStore {
     if (!raw) { return new Library(); }
     const library = JSON.parse(raw) as Library;
     library.autoFallback = library.autoFallback ?? false;
+    library.replyAnchors = library.replyAnchors ?? {};
     library.sourceOrder = library.sourceOrder ?? [];
     library.hiddenSources = library.hiddenSources ?? [];
     library.sourceLimit = Number.isFinite(library.sourceLimit) ? Math.max(0, Math.min(8, Math.floor(library.sourceLimit))) : 8;

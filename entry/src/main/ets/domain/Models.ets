@@ -1,5 +1,6 @@
 export type Site = 'v2ex' | 'linuxdo';
 export class Topic {
+  webOnly: boolean = false;
   site: Site = 'v2ex';
   id: string = '';
   title: string = '';
@@ -14,6 +15,7 @@ export class Reply {
   id: string = '';
   author: string = '';
   floor: number = 0;
+  parentFloor: number = 0;
   body: string = '';
   html: string = '';
 }
@@ -27,6 +29,7 @@ export class Library {
   bookmarks: Topic[] = [];
   history: Topic[] = [];
   progress: Record<string, number> = {};
+  replyAnchors: Record<string, string> = {};
   fontSize: number = 17;
   dark: boolean = false;
   accepted: boolean = false;
@@ -36,3 +39,9 @@ export class Library {
   sourceLimit: number = 8;
 }
 export function topicKey(t: Topic): string { return `${t.site}:${t.id}`; }
+
+export function readingOffsetToSave(loaded: boolean, offset: number | undefined, previous: number | undefined): number | undefined {
+  if (!loaded || offset === undefined || !Number.isFinite(offset)) { return undefined; }
+  const position = Math.max(0, offset);
+  return position === (previous ?? 0) ? undefined : position;
+}

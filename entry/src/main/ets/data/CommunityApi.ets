@@ -14,7 +14,7 @@ interface VProfile { success: boolean; result: VMember; }
 interface DTopic { id: number; title: string; posts_count: number; category_id: number; }
 interface DList { topic_list: DTopicList; }
 interface DTopicList { topics: DTopic[]; }
-interface DPost { id: number; username: string; post_number: number; cooked: string; }
+interface DPost { id: number; username: string; post_number: number; cooked: string; reply_to_post_number?: number; }
 interface DStream { posts: DPost[]; stream: number[]; }
 interface DDetail extends DTopic { post_stream: DStream; }
 interface DPosts { post_stream: DStream; }
@@ -44,7 +44,7 @@ function mapD(t: DTopic): Topic {
 }
 function mapReply(p: DPost): Reply {
   const reply = new Reply(); reply.id = String(p.id); reply.author = p.username;
-  reply.floor = p.post_number; reply.body = readable(p.cooked); reply.html = p.cooked || ''; return reply;
+  reply.floor = p.post_number; reply.parentFloor = p.reply_to_post_number ?? 0; reply.body = readable(p.cooked); reply.html = p.cooked || ''; return reply;
 }
 export class CommunityApi {
   // Deliberately memory-only: never write credentials to Preferences or logs.
