@@ -12,7 +12,14 @@ export class LocalStore {
     if (!raw) { return new Library(); }
     const library = JSON.parse(raw) as Library;
     library.autoFallback = library.autoFallback ?? false;
+    library.rememberToken = library.rememberToken ?? false;
+    library.webZoom = library.webZoom ?? 100;
+    library.bookmarks.forEach((topic: Topic) => {
+      topic.tags = topic.tags ?? [];
+      topic.read = topic.read ?? library.history.some((item: Topic) => topicKey(item) === topicKey(topic));
+    });
     library.replyAnchors = library.replyAnchors ?? {};
+    library.bodyAnchors = library.bodyAnchors ?? {};
     library.sourceOrder = library.sourceOrder ?? [];
     library.hiddenSources = library.hiddenSources ?? [];
     library.sourceLimit = Number.isFinite(library.sourceLimit) ? Math.max(0, Math.min(8, Math.floor(library.sourceLimit))) : 8;

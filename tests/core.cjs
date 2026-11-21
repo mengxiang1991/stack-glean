@@ -12,6 +12,18 @@ const network = { http: { RequestMethod: { GET: 'GET' }, createHttp: () => ({
   destroy: () => destroyed++
 }) } };
 const modules = new Map();
+let secureValue;
+const asset = {
+  Tag: { ALIAS: 'alias', SECRET: 'secret', RETURN_TYPE: 'return', ACCESSIBILITY: 'access' },
+  ReturnType: { ALL: 0 }, Accessibility: { DEVICE_UNLOCKED: 2 },
+  query: async () => {
+    if (!secureValue) { throw { code: 24000002 }; }
+    return [new Map([['secret', secureValue]])];
+  },
+  add: async values => { secureValue = values.get('secret'); },
+  update: async (_query, values) => { secureValue = values.get('secret'); },
+  remove: async () => { secureValue = undefined; }
+};
 const disk = new Map();
 const prefs = { get: async (key, fallback) => disk.has(key) ? disk.get(key) : fallback,
   put: async (key, value) => { disk.set(key, value); }, delete: async key => { disk.delete(key); }, flush: async () => {} };
@@ -21,6 +33,12 @@ function load(file) {
   const code = ts.transpileModule(fs.readFileSync(file, 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
   vm.runInNewContext(`(function(require,module,exports){${code}\n})`, { console })(name => {
     if (name === '@kit.NetworkKit') return network;
+    if (name === '@kit.AssetStoreKit') return { asset };
+    if (name === '@kit.BasicServicesKit') return {};
+    if (name === '@kit.ArkTS') return { util: {
+      TextEncoder: class { encodeInto(text) { return new TextEncoder().encode(text); } },
+      TextDecoder: class { decodeWithStream(bytes) { return new TextDecoder().decode(bytes); } }
+    }};
     if (name === '@kit.ArkData') return { preferences: { getPreferences: async () => prefs } };
     if (name === '@kit.AbilityKit') return {};
     return load(path.resolve(path.dirname(file), name + '.ets'));
@@ -28,6 +46,46 @@ function load(file) {
   return module.exports;
 }
 (async () => {
+  const { useSideNavigation, useSplitReader, readerPaneWidth } = load(path.join(root, 'domain/ResponsiveLayout.ets'));
+  assert.equal(useSideNavigation(599), false);
+  assert.equal(useSideNavigation(600), true);
+  assert.equal(useSplitReader(999), false);
+  assert.equal(useSplitReader(1000), true);
+  assert.equal(useSplitReader(400), false);
+  assert.equal(readerPaneWidth(1200, true), 746);
+  assert.equal(readerPaneWidth(1600, false), 860);
+  assert.equal(readerPaneWidth(400, false), 400);
+  const { CredentialStore } = load(path.join(root, 'data/CredentialStore.ets'));
+  const credentials = new CredentialStore();
+  assert.equal(await credentials.read(), '');
+  await credentials.save('first-token');
+  assert.equal(await credentials.read(), 'first-token');
+  await credentials.save('updated-token');
+  assert.equal(await credentials.read(), 'updated-token');
+  await credentials.remove();
+  assert.equal(await credentials.read(), '');
+  const { articleBlocks } = load(path.join(root, 'domain/ArticleBlocks.ets'));
+  const blocks = articleBlocks('<p>First</p><p>Keep this</p>', 'v2ex');
+  const changed = articleBlocks('<p>New paragraph</p><p>First</p><p>Keep this</p>', 'v2ex');
+  assert.equal(blocks[1].id, changed[2].id);
+  assert.ok(articleBlocks('<script>bad()</script><pre><code>a &lt; b</code></pre>', 'v2ex')[0].html.includes('<pre>'));
+  const { importBookmarks, exportBookmarks } = load(path.join(root, 'domain/BookmarkTransfer.ets'));
+  const models = load(path.join(root, 'domain/Models.ets'));
+  const transferLibrary = new models.Library();
+  const webBookmark = new models.Topic();
+  webBookmark.id = 'https://example.com/post';
+  webBookmark.url = webBookmark.id;
+  webBookmark.webOnly = true;
+  webBookmark.title = 'A saved page';
+  webBookmark.tags = ['ArkTS'];
+  webBookmark.read = true;
+  transferLibrary.bookmarks = [webBookmark];
+  const roundtrip = importBookmarks(exportBookmarks(transferLibrary), []);
+  assert.equal(roundtrip[0].tags[0], 'ArkTS');
+  assert.equal(roundtrip[0].read, true);
+  assert.equal(importBookmarks(exportBookmarks(transferLibrary), roundtrip).length, 1);
+  assert.throws(() => importBookmarks('{"version":99,"bookmarks":[]}', []), /版本/);
+  assert.throws(() => importBookmarks('{"version":1,"bookmarks":[{"id":"a","url":"javascript:bad()","site":"v2ex","webOnly":true,"title":"bad"}]}', []), /无效/);
   const { readingOffsetToSave } = load(path.join(root, 'domain/Models.ets'));
   assert.equal(readingOffsetToSave(false, 90, 420), undefined);
   assert.equal(readingOffsetToSave(true, undefined, 420), undefined);
@@ -98,8 +156,11 @@ function load(file) {
   assert.equal(configured.autoFallback, true);
   assert.equal(configured.sourceLimit, 3); assert.equal(configured.sourceOrder.join(','), 'github,infoq');
   assert.equal(configured.hiddenSources.join(','), 'infoq');
+  assert.equal(configured.webZoom, 100);
+  assert.equal(configured.rememberToken, false);
   console.log('PASS: markup safety, V2EX mapping, finite feed, token login/logout, auth isolation, Discourse stream, HTTP errors, transport cleanup');
   console.log('PASS: library persistence, 20-topic cache eviction, cache clearing preserves bookmarks/progress');
   console.log('PASS: rich HTML allowlist, unsafe URL/handler removal, relative images, code/quotes, escaped fallback');
   console.log('PASS: source ordering, move boundaries, visibility/count, old-settings migration and persistence');
+  console.log('PASS: safe bookmark transfer, stable article anchors and secure credential lifecycle');
 })().catch(e => { console.error(e); process.exitCode = 1; });

@@ -1,14 +1,28 @@
+import { useSideNavigation, useSplitReader, readerPaneWidth } from '../domain/ResponsiveLayout';
+import { articleBlocks, ArticleBlock } from '../domain/ArticleBlocks';
+import { ReaderTools } from '../components/ReaderTools';
+import { CredentialStore } from '../data/CredentialStore';
+import { BookmarkFiles } from '../data/BookmarkFiles';
+import { exportBookmarks, importBookmarks } from '../domain/BookmarkTransfer';
+import { pasteboard } from '@kit.BasicServicesKit';
 import { common } from '@kit.AbilityKit';
 import { webview } from '@kit.ArkWeb';
 import { Topic, Reply, Detail, Library, Site, topicKey, readingOffsetToSave } from '../domain/Models';
-import { CommunityApi } from '../data/CommunityApi';
+import { CommunityApi, ApiError } from '../data/CommunityApi';
 import { LocalStore } from '../data/LocalStore';
 import { richDocument } from '../domain/RichContent';
 import { WEB_SOURCES, WebSource, orderedSources, visibleSources, moveSource } from '../domain/WebSources';
 
+class FeedSnapshot {
+  topics: Topic[] = [];
+  offset: number = 0;
+  page: number = 0;
+  more: boolean = false;
+}
 @Entry
 @Component
 struct Index {
+  @State private windowWidth: number = 400;
   @State private site: Site = 'v2ex';
   @State private tab: number = 0;
   @State private hot: boolean = false;
@@ -32,6 +46,13 @@ struct Index {
   @State private libraryQuery: string = '';
   @State private unreadOnly: boolean = false;
   @State private floorInput: string = '';
+  @State private webTools: boolean = false;
+  @State private webSearch: string = '';
+  @State private webProgress: number = 0;
+  @State private restoring: boolean = false;
+  private credentials: CredentialStore = new CredentialStore();
+  private bookmarkFiles: BookmarkFiles = new BookmarkFiles();
+  private feedSnapshots: Map<string, FeedSnapshot> = new Map();
   private api: CommunityApi = new CommunityApi();
   private storage: LocalStore = new LocalStore();
   private webController: webview.WebviewController = new webview.WebviewController();
@@ -44,12 +65,19 @@ struct Index {
   @State private more: boolean = false;
   private progressY: number | undefined = undefined;
   private visibleReply: string = '';
+  private visibleBody: string = '';
 
   onPageHide(): void { this.saveReadingPosition(); }
 
   async aboutToAppear(): Promise<void> {
     try { this.library = await this.storage.open(this.getUIContext().getHostContext() as common.UIAbilityContext); }
     catch { this.message = '本地存储读取失败，请检查设备空间。'; }
+    if (this.library.accepted && this.library.rememberToken) {
+      try {
+        const token = await this.credentials.read();
+        if (token) { this.accountName = await this.api.login(token); }
+      } catch (error) { if (!this.handleExpired(error as Error)) { this.message = '已保存的账号暂时无法验证，请在账号页重新登录。'; } }
+    }
     this.ready = true;
     if (this.library.accepted) { await this.loadFeed(); }
   }
@@ -66,7 +94,19 @@ struct Index {
   private bg(): string { return this.library.dark ? '#14201D' : '#F4F5F2'; }
   private card(): string { return this.library.dark ? '#20332B' : '#FFFFFF'; }
   private ink(): string { return this.library.dark ? '#E4EEE7' : '#233D32'; }
-  private muted(): string { return this.library.dark ? '#A1B8AB' : '#718278'; }
+  private muted(): string { return this.library.dark ? '#A1B8AB' : '#5C7065'; }
+  private handleExpired(error: Error): boolean {
+    if (!(error instanceof ApiError) || error.status !== 401) { return false; }
+    this.api.logout();
+    this.accountName = '';
+    this.selected = undefined;
+    this.detailRequestId++;
+    this.tab = 2;
+    this.settingsPage = 'account';
+    this.message = '登录已过期，请重新输入令牌。';
+    this.credentials.remove().catch(() => { this.message = '登录已过期，已保存的令牌删除失败，请重试退出。'; });
+    return true;
+  }
   private async persist(): Promise<void> {
     try { await this.storage.save(this.library); } catch { this.message = '保存失败，请检查设备空间。'; }
   }
@@ -79,7 +119,7 @@ struct Index {
     if (append && (this.busy || this.loadingMore || !this.more)) { return; }
     const generation = ++this.requestId;
     const site = this.site; const page = append ? this.feedPage + 1 : 0;
-    if (append) { this.loadingMore = true; } else { this.busy = true; this.loadingMore = false; this.topics = []; this.feedOffset = 0; }
+    if (append) { this.loadingMore = true; } else { this.busy = true; this.loadingMore = false; /* keep visible data while refreshing */ }
     this.error = '';
     try {
       const rows = await this.api.feed(site, this.hot, page);
@@ -90,13 +130,44 @@ struct Index {
     } catch (e) {
       if (generation === this.requestId) {
         this.error = (e as Error).message || '网络不可用，请重试。';
-        if (this.library.autoFallback && this.tab === 0 && !this.selected && !this.webUrl) { this.fallback(site); }
+        if (this.library.autoFallback && this.topics.length === 0 && this.tab === 0 && !this.selected && !this.webUrl) { this.fallback(site); }
       }
     }
     finally { if (generation === this.requestId) { this.busy = false; this.loadingMore = false; } }
   }
-  private switchSite(site: Site): void { if (site !== this.site) { this.site = site; this.loadFeed(); } }
+  private changeFeed(site: Site, hot: boolean): void {
+    if (site === this.site && hot === this.hot) { return; }
+    const snapshot = new FeedSnapshot();
+    snapshot.topics = this.topics;
+    snapshot.offset = this.feedOffset;
+    snapshot.page = this.feedPage;
+    snapshot.more = this.more;
+    this.feedSnapshots.set(this.site + ':' + this.hot, snapshot);
+    this.requestId++;
+    this.busy = false;
+    this.loadingMore = false;
+    this.site = site;
+    this.hot = hot;
+    this.error = '';
+    const saved = this.feedSnapshots.get(site + ':' + hot);
+    this.topics = saved?.topics ?? [];
+    this.feedOffset = saved?.offset ?? 0;
+    this.feedPage = saved?.page ?? 0;
+    this.more = saved?.more ?? false;
+    if (!saved) { this.loadFeed(); }
+    else { setTimeout(() => { this.feedScroller.scrollTo({ xOffset: 0, yOffset: this.feedOffset }); }, 80); }
+  }
+  private switchSite(site: Site): void { this.changeFeed(site, this.hot); }
+  private markRead(topic: Topic): void {
+    this.library.bookmarks = this.library.bookmarks.map((item: Topic) => {
+      if (topicKey(item) === topicKey(topic)) { item.read = true; }
+      return item;
+    });
+    this.persist();
+  }
   private async openTopic(topic: Topic): Promise<void> {
+    this.saveReadingPosition();
+    this.markRead(topic);
     if (topic.webOnly) {
       this.webUrl = topic.url;
       this.fallbackNotice = '';
@@ -109,6 +180,7 @@ struct Index {
     this.detailFailed = false;
     this.progressY = undefined;
     this.visibleReply = '';
+    this.visibleBody = '';
     const id = ++this.detailRequestId; const epoch = this.api.epoch;
     const shell = new Detail(); shell.topic = topic; this.selected = shell;
     this.message = '正在加载正文与评论…';
@@ -127,6 +199,7 @@ struct Index {
       }
     } catch (e) {
       if (id !== this.detailRequestId || epoch !== this.api.epoch) { return; }
+      if (this.handleExpired(e as Error)) { return; }
       this.detailFailed = true;
       if (this.library.autoFallback && !this.webUrl) {
         this.message = (e as Error).message || '主题加载失败。';
@@ -146,6 +219,7 @@ struct Index {
       if (position !== undefined) {
         this.library.progress[key] = position;
         this.library.replyAnchors[key] = this.visibleReply;
+        this.library.bodyAnchors[key] = this.visibleBody;
         this.persist();
       }
     }
@@ -171,14 +245,57 @@ struct Index {
       updated.nextPage = current.nextPage; updated.remainingIds = current.remainingIds; this.selected = updated;
     } catch (e) {
       if (id === this.detailRequestId && epoch === this.api.epoch) {
+        if (this.handleExpired(e as Error)) { return; }
         this.message = (e as Error).message;
         if (this.library.autoFallback && !this.webUrl) { this.fallback(current.topic.site, current.topic.id); }
       }
     }
     finally { this.loadingMore = false; }
   }
+  private async transferBookmarks(exporting: boolean): Promise<void> {
+    try {
+      const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      if (exporting) {
+        const saved = await this.bookmarkFiles.exportFile(context, exportBookmarks(this.library));
+        this.message = saved ? '收藏已导出。' : '已取消导出。';
+      } else {
+        const text = await this.bookmarkFiles.importFile(context);
+        if (!text) { this.message = '已取消导入。'; return; }
+        const merged = importBookmarks(text, this.library.bookmarks);
+        const candidate = JSON.parse(JSON.stringify(this.library)) as Library;
+        candidate.bookmarks = merged;
+        await this.storage.save(candidate);
+        this.library = candidate;
+        this.message = '收藏已合并，现有条目保留。';
+      }
+    } catch (error) { this.message = (error as Error).message || '文件操作失败，请重试。'; }
+  }
+  private updateBookmark(topic: Topic, tags: string, read: boolean): void {
+    this.library.bookmarks = this.library.bookmarks.map((item: Topic) => {
+      if (topicKey(item) === topicKey(topic)) {
+        item.tags = tags.split(/[,，]/).map((tag: string) => tag.trim()).filter((tag: string) => tag.length > 0).slice(0, 10);
+        item.read = read;
+      }
+      return item;
+    });
+    this.persist();
+  }
+  private async copyWebLink(): Promise<void> {
+    try {
+      await pasteboard.getSystemPasteboard().setData(pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, this.webController.getUrl()));
+      this.fallbackNotice = '链接已复制。';
+    } catch { this.fallbackNotice = '复制失败，请稍后重试。'; }
+  }
+  private async openExternal(): Promise<void> {
+    try {
+      const url = this.webController.getUrl();
+      if (!url.startsWith('https://')) { this.fallbackNotice = '仅支持打开 HTTPS 链接。'; return; }
+      const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      await context.startAbility({ action: 'ohos.want.action.viewData', entities: ['entity.system.browsable'], uri: url });
+    } catch { this.fallbackNotice = '无法打开系统浏览器。'; }
+  }
   private matchesLibrary(topic: Topic): boolean {
-    return (topic.title + ' ' + topic.author + ' ' + topic.url).toLowerCase().includes(this.libraryQuery.trim().toLowerCase());
+    return (topic.title + ' ' + topic.author + ' ' + topic.url + ' ' + (topic.tags ?? []).join(' ')).toLowerCase().includes(this.libraryQuery.trim().toLowerCase());
   }
   private saveWebPage(): void {
     try {
@@ -190,6 +307,7 @@ struct Index {
       topic.url = url;
       topic.title = this.webController.getTitle() || url;
       topic.category = '原站网页';
+      topic.read = true;
       if (!this.bookmarked(topic)) {
         this.library.bookmarks = [topic, ...this.library.bookmarks].slice(0, 200);
         this.persist();
@@ -197,21 +315,46 @@ struct Index {
       this.fallbackNotice = '已保存到稍后读。';
     } catch { this.fallbackNotice = '请等网页加载完成后再保存。'; }
   }
+  private bodyBlocks(detail: Detail): ArticleBlock[] {
+    return articleBlocks(detail.topic.html || '<p>' + detail.topic.body.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>') + '</p>', detail.topic.site);
+  }
+  private replyStart(detail: Detail): number { return this.bodyBlocks(detail).length + 2; }
   private jumpFloor(detail: Detail, floor: number): void {
     const index = detail.replies.findIndex((reply: Reply) => reply.floor === floor);
     if (index >= 0) {
       this.message = '';
-      this.detailScroller.scrollToIndex(index + 1, false, ScrollAlign.START);
+      this.detailScroller.scrollToIndex(index + this.replyStart(detail), false, ScrollAlign.START);
     } else if (detail.topic.site === 'linuxdo' && floor === 1) {
       this.message = '';
       this.detailScroller.scrollToIndex(0);
     } else { this.message = '该楼层还未加载，可继续加载评论或查看原帖。'; }
   }
-  private resumeDetail(detail: Detail): void {
+  private async resumeDetail(detail: Detail): Promise<void> {
+    if (this.restoring) { return; }
+    this.restoring = true;
+    const generation = this.detailRequestId;
     const key = topicKey(detail.topic);
-    const index = detail.replies.findIndex((reply: Reply) => reply.id === this.library.replyAnchors[key]);
-    if (index >= 0) { this.detailScroller.scrollToIndex(index + 1, false, ScrollAlign.START); }
-    else { this.detailScroller.scrollTo({ xOffset: 0, yOffset: this.library.progress[key] }); }
+    const anchor = this.library.replyAnchors[key];
+    try {
+      let current = detail;
+      for (let page = 0; anchor && page < 30 && !current.replies.some((reply: Reply) => reply.id === anchor); page++) {
+        if (generation !== this.detailRequestId || (!current.nextPage && !current.remainingIds.length)) { break; }
+        const count = current.replies.length;
+        await this.moreReplies();
+        if (generation !== this.detailRequestId || !this.selected) { return; }
+        current = this.selected;
+        if (current.replies.length === count) { break; }
+      }
+      if (generation !== this.detailRequestId) { return; }
+      const index = current.replies.findIndex((reply: Reply) => reply.id === anchor);
+      if (index >= 0) { this.detailScroller.scrollToIndex(index + this.replyStart(current), false, ScrollAlign.START); }
+      else {
+        const bodyIndex = this.bodyBlocks(current).findIndex((block: ArticleBlock) => block.id === this.library.bodyAnchors[key]);
+        if (bodyIndex >= 0 && !anchor) { this.detailScroller.scrollToIndex(bodyIndex + 1, false, ScrollAlign.START); }
+        else { this.detailScroller.scrollTo({ xOffset: 0, yOffset: this.library.progress[key] }); }
+        if (anchor) { this.message = '本次未找到原评论，已恢复近似位置。可加载更多评论后再试。'; }
+      }
+    } finally { this.restoring = false; }
   }
   private bookmarked(topic: Topic): boolean { return this.library.bookmarks.some((t: Topic) => topicKey(t) === topicKey(topic)); }
   private bookmark(topic: Topic): void {
@@ -219,18 +362,20 @@ struct Index {
     if (this.bookmarked(topic)) { this.library.bookmarks = this.library.bookmarks.filter((t: Topic) => topicKey(t) !== topicKey(topic)); }
     else {
       const copy = new Topic(); copy.site = topic.site; copy.id = topic.id; copy.title = topic.title;
-      copy.author = topic.author; copy.category = topic.category; copy.replies = topic.replies; copy.url = topic.url;
+      copy.read = true; copy.author = topic.author; copy.category = topic.category; copy.replies = topic.replies; copy.url = topic.url;
       this.library.bookmarks = [copy, ...this.library.bookmarks].slice(0, 200);
     }
     this.persist();
   }
   private async login(): Promise<void> {
     if (this.loginBusy) { return; } this.loginBusy = true; this.message = '';
-    try { this.accountName = await this.api.login(this.tokenInput); this.tokenInput = ''; this.message = '已验证 V2EX 账号；令牌仅保留到应用退出。'; }
+    try { this.accountName = await this.api.login(this.tokenInput); if (this.library.rememberToken) { await this.credentials.save(this.tokenInput); }
+      this.message = this.library.rememberToken ? '已登录，令牌已保存至系统安全存储。' : '已登录，本次会话有效。'; }
     catch (e) { this.message = (e as Error).message; }
-    finally { this.loginBusy = false; }
+    finally { this.tokenInput = ''; this.loginBusy = false; }
   }
-  private logout(): void {
+  private async logout(): Promise<void> {
+    try { await this.credentials.remove(); } catch { this.message = '安全存储清理失败，请重试退出。'; return; }
     this.api.logout(); this.accountName = ''; this.tokenInput = ''; this.detailRequestId++;
     this.selected = undefined; this.message = '已退出 V2EX，恢复游客阅读。';
   }
@@ -252,7 +397,7 @@ struct Index {
   }
   @Builder private feed() {
     Column({ space: 16 }) {
-      Text('今天，读点新东西').fontSize(28).fontWeight(FontWeight.Bold).fontColor(this.ink()).width('100%')
+      Text('今天，读点新东西').fontSize(30).fontWeight(FontWeight.Bold).fontColor(this.ink()).width('100%')
       Scroll() {
         Row({ space: 10 }) {
           ForEach(visibleSources(this.library.sourceOrder, this.library.hiddenSources, this.library.sourceLimit), (source: WebSource) => {
@@ -269,12 +414,12 @@ struct Index {
       Text('左右滑动选择站点 · 显示数量与顺序可在设置中调整').fontSize(12).fontColor(this.muted()).width('100%')
       if (visibleSources(this.library.sourceOrder, this.library.hiddenSources, this.library.sourceLimit).some((source: WebSource) => source.id === this.site)) {
       Row({ space: 16 }) {
-        Button(this.hot ? '最新' : '✓ 最新').backgroundColor(this.card()).fontColor(this.ink()).onClick(() => { this.hot = false; this.loadFeed(); })
-        Button(this.hot ? '✓ 热门' : '热门').backgroundColor(this.card()).fontColor(this.ink()).onClick(() => { this.hot = true; this.loadFeed(); })
+        Button(this.hot ? '最新' : '✓ 最新').backgroundColor(this.card()).fontColor(this.ink()).onClick(() => { this.changeFeed(this.site, false); })
+        Button(this.hot ? '✓ 热门' : '热门').backgroundColor(this.card()).fontColor(this.ink()).onClick(() => { this.changeFeed(this.site, true); })
         Blank()
         Button('刷新').backgroundColor(this.card()).fontColor(this.ink()).onClick(() => this.loadFeed())
       }.width('100%')
-      if (this.busy) { LoadingProgress().width(36).height(36) }
+      if (this.busy) { Text('正在更新，已有内容可继续阅读').fontColor(this.muted()); LoadingProgress().width(36).height(36) }
       if (this.error) {
         this.note(this.error)
         Row({ space: 12 }) {
@@ -289,14 +434,14 @@ struct Index {
           else if (!this.busy && this.topics.length > 0) { this.note('已展示接口当前可用列表') }
         }
       }.layoutWeight(1).width('100%')
-        .onDidScroll(() => { this.feedOffset = this.feedScroller.currentOffset().yOffset; })
-        .onAppear(() => { const offset = this.feedOffset; setTimeout(() => { if (!this.selected && this.tab === 0) { this.feedScroller.scrollTo({ xOffset: 0, yOffset: offset }); } }, 80); })
+        .onDidScroll((_offset: number, state: ScrollState) => { if (state !== ScrollState.Idle) { this.feedOffset = this.feedScroller.currentOffset().yOffset; } })
+        .onAppear(() => { const offset = this.feedOffset; setTimeout(() => { if ((!this.selected || useSplitReader(this.windowWidth)) && this.tab === 0) { this.feedScroller.scrollTo({ xOffset: 0, yOffset: offset }); } }, 80); })
       } else {
         this.note('当前原生站点未在显示范围内，请选择上方站点，或在设置中调整数量和显示开关。其他技术站点会打开原站网页。')
         Button('管理站点').onClick(() => { this.settingsPage = 'sites'; this.tab = 2; })
         Blank()
       }
-    }.padding({ left: 20, right: 20, top: 18 }).height('100%')
+    }.padding({ left: 18, right: 18, top: 10 }).height('100%')
   }
   @Builder private topicView(detail: Detail) {
     Column({ space: 12 }) {
@@ -312,7 +457,7 @@ struct Index {
       Row({ space: 10 }) {
         Button(this.bookmarked(detail.topic) ? '已加入稍后读' : '稍后读').onClick(() => this.bookmark(detail.topic))
         if (this.detailLoaded && (!this.accountName || detail.topic.site !== 'v2ex') && (this.library.progress[topicKey(detail.topic)] ?? 0) > 0) {
-          Button('恢复进度').onClick(() => this.resumeDetail(detail))
+          Button(this.restoring ? '正在查找原位置…' : '恢复进度').enabled(!this.restoring).onClick(() => this.resumeDetail(detail))
         }
       }
       if (this.detailLoaded && detail.replies.length > 0) {
@@ -327,9 +472,18 @@ struct Index {
           Column({ space: 16 }) {
             Text(detail.topic.title).fontSize(26).fontWeight(FontWeight.Bold).fontColor(this.ink())
             Text(`${detail.topic.author} · ${detail.topic.category}`).fontSize(13).fontColor(this.muted())
-            RichText(richDocument(detail.topic.html || '', detail.topic.body || '正文尚未载入，请等待或在原站查看。', this.getUIContext().fp2px(this.library.fontSize), this.library.dark, detail.topic.site)).width('100%')
-            Text(`评论 · 已加载 ${detail.replies.length} / ${detail.topic.replies}`).fontSize(18).fontColor(this.ink()).width('100%')
           }.alignItems(HorizontalAlign.Start).width('100%')
+        }
+        ForEach(this.bodyBlocks(detail), (block: ArticleBlock) => {
+          ListItem() {
+            Column({ space: 8 }) {
+              RichText(richDocument(block.html, '', this.getUIContext().fp2px(this.library.fontSize), this.library.dark, detail.topic.site)).width('100%')
+              ReaderTools({ html: block.html, site: detail.topic.site })
+            }.width('100%')
+          }
+        }, (block: ArticleBlock) => block.id)
+        ListItem() {
+          Text('评论 · 已加载 ' + detail.replies.length + ' / ' + detail.topic.replies).fontSize(18).fontColor(this.ink())
         }
         ForEach(detail.replies, (reply: Reply) => {
           ListItem() {
@@ -339,6 +493,7 @@ struct Index {
                 Button('查看回复对象 #' + reply.parentFloor).onClick(() => this.jumpFloor(detail, reply.parentFloor))
               }
               RichText(richDocument(reply.html || '', reply.body, this.getUIContext().fp2px(this.library.fontSize), this.library.dark, detail.topic.site)).width('100%')
+              ReaderTools({ html: reply.html, site: detail.topic.site })
             }.alignItems(HorizontalAlign.Start).padding(16).backgroundColor(this.card()).borderRadius(14).width('100%')
           }
         }, (reply: Reply) => reply.id)
@@ -350,13 +505,16 @@ struct Index {
       }.layoutWeight(1).width('100%').onDidScroll((_offset: number, state: ScrollState) => {
         if (this.detailLoaded && state !== ScrollState.Idle) { this.progressY = this.detailScroller.currentOffset().yOffset; }
       }).onScrollIndex((start: number) => {
-        this.visibleReply = start >= 1 && start <= detail.replies.length ? detail.replies[start - 1].id : '';
+        const replyIndex = start - this.replyStart(detail);
+        this.visibleReply = replyIndex >= 0 && replyIndex < detail.replies.length ? detail.replies[replyIndex].id : '';
+        const blocks = this.bodyBlocks(detail);
+        this.visibleBody = start >= 1 && start <= blocks.length ? blocks[start - 1].id : '';
       }).onScrollStop(() => { this.saveReadingPosition(); })
     }.padding(20).height('100%')
   }
   @Builder private libraryView() {
     List({ space: 14 }) {
-      ListItem() { Text('我的阅读').fontSize(28).fontWeight(FontWeight.Bold).fontColor(this.ink()) }
+      ListItem() { Text('我的阅读').fontSize(30).fontWeight(FontWeight.Bold).fontColor(this.ink()) }
       ListItem() { this.note('稍后读和历史保存在本机。登录态 V2EX 内容暂不持久保存，避免账号内容混入游客空间。') }
       ListItem() { Text(`稍后读 · ${this.library.bookmarks.length}`).fontSize(19).fontColor(this.ink()) }
       ListItem() {
@@ -367,12 +525,22 @@ struct Index {
         }
       }
       ForEach(this.library.bookmarks.filter((topic: Topic) => this.matchesLibrary(topic) &&
-        (!this.unreadOnly || !this.library.history.some((item: Topic) => topicKey(item) === topicKey(topic)))), (topic: Topic) => {
-        ListItem() { Column({ space: 6 }) { this.row(topic); Button('移除').onClick(() => this.bookmark(topic)) } }
-      }, (t: Topic) => `b:${topicKey(t)}`)
+        (!this.unreadOnly || !topic.read)), (topic: Topic) => {
+        ListItem() {
+          Column({ space: 8 }) {
+            this.row(topic)
+            TextInput({ placeholder: '标签，用逗号分隔', text: (topic.tags ?? []).join(', ') })
+              .onChange((value: string) => this.updateBookmark(topic, value, topic.read))
+            Row({ space: 10 }) {
+              Button(topic.read ? '标为未读' : '标为已读').onClick(() => this.updateBookmark(topic, (topic.tags ?? []).join(','), !topic.read))
+              Button('移除').onClick(() => this.bookmark(topic))
+            }
+          }
+        }
+      }, (t: Topic) => `b:${topicKey(t)}:${t.read}`)
       ListItem() { Text(`阅读历史 · ${this.library.history.length}`).fontSize(19).fontColor(this.ink()) }
       ForEach(this.library.history.filter((topic: Topic) => this.matchesLibrary(topic)), (topic: Topic) => { ListItem() { this.row(topic) } }, (t: Topic) => `h:${topicKey(t)}`)
-      ListItem() { Button('清空历史与进度').onClick(() => { this.library.history = []; this.library.progress = {}; this.library.replyAnchors = {}; this.persist(); }) }
+      ListItem() { Button('清空历史与进度').onClick(() => { this.library.history = []; this.library.progress = {}; this.library.replyAnchors = {}; this.library.bodyAnchors = {}; this.persist(); }) }
     }.padding(20).height('100%').width('100%')
   }
   @Builder private settingsEntry(title: string, summary: string, destination: string) {
@@ -455,16 +623,31 @@ struct Index {
             Text('在代码之间，留一点时间读世界。').fontSize(this.library.fontSize).lineHeight(this.library.fontSize * 1.85).fontColor(this.ink()).padding(18).backgroundColor(this.card()).borderRadius(14).width('100%')
           } else if (this.settingsPage === 'account') {
         this.note(this.accountName ? `V2EX · ${this.accountName}` : '当前使用游客模式，无需登录即可阅读公开内容。')
+        Row() {
+          Text('记住 V2EX 登录').fontColor(this.ink()).layoutWeight(1)
+          Toggle({ type: ToggleType.Switch, isOn: this.library.rememberToken }).onChange(async (enabled: boolean) => {
+            try {
+              if (!enabled) { await this.credentials.remove(); }
+              this.library.rememberToken = enabled;
+              this.persist();
+            } catch { this.message = '安全存储操作失败，请重试。'; }
+          })
+        }.width('100%')
         if (!this.accountName) {
           TextInput({ placeholder: 'V2EX 个人访问令牌', text: this.tokenInput }).type(InputType.Password).onChange((value: string) => { this.tokenInput = value; })
           Button(this.loginBusy ? '验证中…' : '登录 V2EX').enabled(!this.loginBusy).onClick(() => this.login())
           Button('如何获取令牌').onClick(() => { this.webUrl = 'https://www.v2ex.com/settings/tokens'; })
-          this.note('令牌仅保存在内存，关闭应用后需重新登录；应用不收集社区密码。登录不会自动同步本地记录。')
+          this.note('可选将令牌保存在系统安全存储，设备解锁后使用。关闭记住登录或退出时删除保存的令牌。')
         } else { Button('退出 V2EX').onClick(() => this.logout()) }
         Button('Linux.do 原站登录 / 阅读').onClick(() => { this.webUrl = 'https://linux.do/login'; })
-        this.note('Linux.do 登录仅在原站浏览页生效，当前原生列表仍使用游客接口；不宣称已接通原生账号权限。')
+        this.note('Linux.do 当前使用原站登录。官方 Connect 接入需要申请应用，身份授权与论坛内容访问权限需分别验证。')
 
           } else if (this.settingsPage === 'data') {
+            Row({ space: 10 }) {
+              Button('导出收藏').onClick(() => this.transferBookmarks(true))
+              Button('导入收藏').onClick(() => this.transferBookmarks(false))
+            }
+            this.note('导出文件包含收藏标题、链接、标签和阅读状态，导入时合并重复条目。')
             this.note('清除正文缓存会移除离线内容，稍后读与阅读历史仍保留。')
         Button('清除离线正文缓存').onClick(async () => {
           try { await this.storage.clearCache(); this.message = '离线缓存已清除，稍后读与历史保留。'; }
@@ -479,7 +662,7 @@ struct Index {
             Button('清空历史与阅读进度').onClick(() => {
               this.getUIContext().showAlertDialog({ title: '清空阅读记录？', message: '阅读历史和进度将被删除，稍后读仍保留。',
                 primaryButton: { value: '取消', action: () => {} },
-                secondaryButton: { value: '清空记录', action: () => { this.library.history = []; this.library.progress = {}; this.library.replyAnchors = {}; this.persist(); this.message = '阅读历史与进度已清空。'; } }
+                secondaryButton: { value: '清空记录', action: () => { this.library.history = []; this.library.progress = {}; this.library.replyAnchors = {}; this.library.bodyAnchors = {}; this.persist(); this.message = '阅读历史与进度已清空。'; } }
               });
             })
           } else if (this.settingsPage === 'about') {
@@ -503,7 +686,7 @@ struct Index {
   }
   @Builder private sources() {
     Column({ space: 16 }) {
-      Text('技术站点').fontSize(28).fontWeight(FontWeight.Bold).fontColor(this.ink()).width('100%')
+      Text('技术站点').fontSize(30).fontWeight(FontWeight.Bold).fontColor(this.ink()).width('100%')
       this.note('点开后在应用内浏览官方网页。各站账号独立，网页内容、登录及可用性由原站提供；不会自动同步到本地稍后读。')
       Row() {
         Text(`已显示 ${visibleSources(this.library.sourceOrder, this.library.hiddenSources, this.library.sourceLimit).length} 个站点`).fontSize(13).fontColor(this.muted())
@@ -533,6 +716,59 @@ struct Index {
       }.layoutWeight(1).width('100%')
     }.padding(20).height('100%').width('100%')
   }
+  private selectTab(tab: number): void {
+    if (this.selected) { this.closeDetail(); }
+    if (tab === 2) { this.settingsPage = 'home'; this.message = ''; }
+    this.tab = tab;
+  }
+  @Builder private navButton(label: string, tab: number) {
+    Button(label).height(48).fontSize(14)
+      .fontColor(this.tab === tab ? (this.library.dark ? '#C8ECD9' : '#287661') : this.muted())
+      .backgroundColor(this.tab === tab ? (this.library.dark ? '#345747' : '#DCEEE6') : Color.Transparent)
+      .width('100%').onClick(() => this.selectTab(tab))
+  }
+  @Builder private pageContent() {
+    if (this.selected) { this.topicView(this.selected) }
+    else if (this.tab === 0) { this.feed() }
+    else if (this.tab === 1) { this.libraryView() }
+    else if (this.tab === 3) { this.sources() }
+    else { this.settings() }
+  }
+  @Builder private appShell() {
+    Row() {
+      if (useSideNavigation(this.windowWidth)) {
+        Column({ space: 12 }) {
+          Text('栈里拾光').fontSize(17).fontWeight(FontWeight.Bold).fontColor(this.ink()).margin({ top: 20, bottom: 20 })
+          this.navButton('阅读', 0)
+          this.navButton('我的阅读', 1)
+          this.navButton('技术站点', 3)
+          this.navButton('设置', 2)
+          Blank()
+        }.width(104).height('100%').padding(8).backgroundColor(this.card())
+      }
+      Column() {
+        Row() {
+          if (useSplitReader(this.windowWidth) && this.selected && this.tab === 0) {
+            Column() { this.feed() }.width(350).height('100%')
+            Divider().vertical(true).height('100%')
+          }
+          Row() {
+            Column() { this.pageContent() }
+              .width(readerPaneWidth(this.windowWidth, useSplitReader(this.windowWidth) && !!this.selected && this.tab === 0))
+              .height('100%')
+          }.layoutWeight(1).height('100%').justifyContent(FlexAlign.Center)
+        }.layoutWeight(1).width('100%')
+        if (!useSideNavigation(this.windowWidth) && !this.selected) {
+          Row({ space: 4 }) {
+            Column() { this.navButton('阅读', 0) }.layoutWeight(1)
+            Column() { this.navButton('我的阅读', 1) }.layoutWeight(1)
+            Column() { this.navButton('技术站点', 3) }.layoutWeight(1)
+            Column() { this.navButton('设置', 2) }.layoutWeight(1)
+          }.padding(8).backgroundColor(this.card()).width('100%')
+        }
+      }.layoutWeight(1).height('100%')
+    }.width('100%').height('100%')
+  }
   build() {
     Column() {
       if (!this.ready) { LoadingProgress().width(48).height(48) }
@@ -549,25 +785,44 @@ struct Index {
           Button('‹ 返回应用').onClick(() => { this.webUrl = ''; this.fallbackNotice = ''; })
           Blank()
           Button('稍后读').onClick(() => this.saveWebPage())
+          Button('工具').onClick(() => { this.webTools = !this.webTools; })
           Button('刷新').onClick(() => { try { this.webController.refresh(); } catch { this.fallbackNotice = '网页尚未就绪，请稍后重试。'; } })
         }.padding(12).width('100%')
         if (this.fallbackNotice) { this.note(this.fallbackNotice) }
-        Web({ src: this.webUrl, controller: this.webController }).javaScriptAccess(true).domStorageAccess(true).layoutWeight(1)
-      } else if (this.selected) { this.topicView(this.selected) }
-      else {
-        Column() {
-          if (this.tab === 0) { this.feed() }
-          else if (this.tab === 1) { this.libraryView() }
-          else if (this.tab === 3) { this.sources() }
-          else { this.settings() }
-        }.layoutWeight(1).width('100%')
-        Row({ space: 12 }) {
-          Button('阅读').fontColor(this.tab === 0 ? '#287661' : this.muted()).backgroundColor(this.card()).layoutWeight(1).onClick(() => { this.tab = 0; })
-          Button('我的阅读').fontColor(this.tab === 1 ? '#287661' : this.muted()).backgroundColor(this.card()).layoutWeight(1).onClick(() => { this.tab = 1; })
-          Button('技术站点').fontColor(this.tab === 3 ? '#287661' : this.muted()).backgroundColor(this.card()).layoutWeight(1).onClick(() => { this.tab = 3; })
-          Button('设置').fontColor(this.tab === 2 ? '#287661' : this.muted()).backgroundColor(this.card()).layoutWeight(1).onClick(() => { this.settingsPage = 'home'; this.message = ''; this.tab = 2; })
-        }.padding(14).backgroundColor(this.card()).width('100%')
-      }
+        if (this.webTools) {
+          Row({ space: 8 }) {
+            Button('复制链接').onClick(() => this.copyWebLink())
+            Button('浏览器打开').onClick(() => this.openExternal())
+          }.padding(8)
+          Row({ space: 8 }) {
+            Button('字小').enabled(this.library.webZoom > 70).onClick(() => { this.library.webZoom -= 10; this.persist(); })
+            Text(this.library.webZoom + '%').fontColor(this.ink())
+            Button('字大').enabled(this.library.webZoom < 200).onClick(() => { this.library.webZoom += 10; this.persist(); })
+          }.padding(8)
+          Row({ space: 6 }) {
+            TextInput({ placeholder: '页内查找', text: this.webSearch }).layoutWeight(1)
+              .onChange((value: string) => { this.webSearch = value; })
+            Button('查找').onClick(() => {
+              try { if (this.webSearch.trim()) { this.webController.searchAllAsync(this.webSearch); } else { this.webController.clearMatches(); } }
+              catch { this.fallbackNotice = '网页未就绪。'; }
+            })
+            Button('下一个').onClick(() => { try { this.webController.searchNext(true); } catch {} })
+          }.padding(8)
+        }
+        if (this.webProgress < 100) { Progress({ value: this.webProgress, total: 100, type: ProgressType.Linear }).width('100%') }
+        Web({ src: this.webUrl, controller: this.webController }).javaScriptAccess(true).domStorageAccess(true)
+          .textZoomRatio(this.library.webZoom)
+          .onProgressChange((event) => { this.webProgress = event.newProgress; })
+          .onErrorReceive((event) => { if (event.request.isMainFrame()) { this.fallbackNotice = '网页加载失败，请检查网络后刷新。'; } })
+          .layoutWeight(1)
+      } else { this.appShell() }
     }.width('100%').height('100%').backgroundColor(this.bg())
+      .onAreaChange((_oldArea: Area, area: Area) => {
+        const width = Number(area.width);
+        if (Number.isFinite(width) && width > 0 && width !== this.windowWidth) {
+          this.saveReadingPosition();
+          this.windowWidth = width;
+        }
+      })
   }
 }

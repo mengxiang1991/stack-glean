@@ -1,6 +1,8 @@
 export type Site = 'v2ex' | 'linuxdo';
 export class Topic {
   webOnly: boolean = false;
+  read: boolean = false;
+  tags: string[] = [];
   site: Site = 'v2ex';
   id: string = '';
   title: string = '';
@@ -30,6 +32,7 @@ export class Library {
   history: Topic[] = [];
   progress: Record<string, number> = {};
   replyAnchors: Record<string, string> = {};
+  bodyAnchors: Record<string, string> = {};
   fontSize: number = 17;
   dark: boolean = false;
   accepted: boolean = false;
@@ -37,6 +40,8 @@ export class Library {
   sourceOrder: string[] = [];
   hiddenSources: string[] = [];
   sourceLimit: number = 8;
+  rememberToken: boolean = false;
+  webZoom: number = 100;
 }
 export function topicKey(t: Topic): string { return `${t.site}:${t.id}`; }
 

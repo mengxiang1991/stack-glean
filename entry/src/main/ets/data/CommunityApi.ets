@@ -19,6 +19,11 @@ interface DStream { posts: DPost[]; stream: number[]; }
 interface DDetail extends DTopic { post_stream: DStream; }
 interface DPosts { post_stream: DStream; }
 
+export class ApiError extends Error {
+  status: number;
+  constructor(message: string, status: number) { super(message); this.status = status; }
+}
+
 // Native plain text renderer: remote markup is never executed.
 export function readable(html: string): string {
   return html.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '')
@@ -59,15 +64,20 @@ export class CommunityApi {
     try {
       const response = await request.request((site === 'v2ex' ? 'https://www.v2ex.com' : 'https://linux.do') + path,
         { method: http.RequestMethod.GET, header: headers, connectTimeout: 12000, readTimeout: 20000 });
-      if (response.responseCode === 401) { throw new Error('登录凭据失效，请退出后重新登录。'); }
-      if (response.responseCode === 403) { throw new Error('站点拒绝访问或当前权限不足，可使用原站阅读。'); }
-      if (response.responseCode === 429) { throw new Error('站点请求限流，请稍后重试。'); }
-      if (response.responseCode !== 200) { throw new Error(`请求失败（${response.responseCode}），请稍后重试。`); }
+      if (response.responseCode === 401) { throw new ApiError('登录凭据失效，请重新登录。', 401); }
+      if (response.responseCode === 403) { throw new ApiError('站点拒绝访问或当前权限不足，可使用原站阅读。', 403); }
+      if (response.responseCode === 429) { throw new ApiError('站点请求限流，请稍后重试。', 429); }
+      if (response.responseCode !== 200) { throw new ApiError(`请求失败（${response.responseCode}），请稍后重试。`, response.responseCode); }
       const result = String(response.result);
       if (!result.trim().startsWith('{') && !result.trim().startsWith('[')) {
         throw new Error('站点返回了网页验证，原生接口暂不可用，请使用原站。');
       }
       return result;
+    } catch (error) {
+      if (error instanceof ApiError) { throw error; }
+      const message = (error as Error).message ?? '';
+      if (message.includes('网页验证')) { throw new ApiError(message, 403); }
+      throw new ApiError(message.toLowerCase().includes('timeout') ? '连接超时，请检查网络后重试。' : '网络连接失败，请检查网络后重试。', 0);
     } finally { request.destroy(); }
   }
   async login(token: string): Promise<string> {
@@ -77,7 +87,11 @@ export class CommunityApi {
       const data = JSON.parse(await this.get('/api/v2/member', 'v2ex', true)) as VProfile;
       if (!data.success || !data.result?.username) { throw new Error('无法验证个人访问令牌。'); }
       this.username = data.result.username; this.epoch++; return this.username;
-    } catch (error) { this.token = previous; throw new Error((error as Error).message || '登录验证失败。'); }
+    } catch (error) {
+      this.token = previous;
+      if (error instanceof ApiError) { throw error; }
+      throw new Error((error as Error).message || '登录验证失败。');
+    }
   }
   async feed(site: Site, hot: boolean, page: number): Promise<Topic[]> {
     if (site === 'v2ex') {
